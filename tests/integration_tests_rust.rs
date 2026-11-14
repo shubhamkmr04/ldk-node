@@ -1045,7 +1045,7 @@ async fn run_splice_channel_test(bitcoind_chain_source: bool) {
 			excessive_splice_out_sats,
 			None
 		),
-		Err(NodeError::ChannelSplicingFailed),
+		Err(NodeError::InsufficientFunds),
 	);
 
 	// Test that splicing and payments fail when there are insufficient funds
@@ -1236,6 +1236,20 @@ async fn splice_channel_with_fee_rate() {
 			Err(NodeError::InvalidFeeRate),
 		);
 	}
+
+	// The fee, about 1,800 sats at this feerate, comes out of the channel balance on top of the
+	// amount, so a splice-out leaving room for only 1,000 sats of it is refused.
+	let outbound_capacity_sats = node_a.list_channels()[0].outbound_capacity_msat / 1_000;
+	assert_eq!(
+		node_a.splice_out(
+			&user_channel_id_a,
+			node_b.node_id(),
+			&address,
+			outbound_capacity_sats - 1_000,
+			Some(fee_rate.into())
+		),
+		Err(NodeError::InsufficientFunds),
+	);
 
 	node_a
 		.splice_out(&user_channel_id_a, node_b.node_id(), &address, 100_000, Some(fee_rate.into()))

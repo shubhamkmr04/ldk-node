@@ -134,8 +134,8 @@ use error::Error;
 pub use event::Event;
 use event::{EventHandler, EventQueue};
 use fee_estimator::{
-	get_fallback_rate_for_target, is_valid_splice_fee_rate, ConfirmationTarget, FeeEstimator,
-	OnchainFeeEstimator, MAX_SPLICE_FEE_RATE,
+	get_fallback_rate_for_target, is_valid_splice_fee_rate, splice_out_fee_sats,
+	ConfirmationTarget, FeeEstimator, OnchainFeeEstimator, MAX_SPLICE_FEE_RATE,
 };
 #[cfg(feature = "uniffi")]
 use ffi::*;
@@ -1646,26 +1646,28 @@ impl Node {
 		if let Some(channel_details) =
 			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
 		{
-			let splice_amount_msat =
-				splice_amount_sats.checked_mul(1_000).ok_or(Error::ChannelSplicingFailed)?;
-			if splice_amount_msat > channel_details.outbound_capacity_msat {
+			let output = bitcoin::TxOut {
+				value: Amount::from_sat(splice_amount_sats),
+				script_pubkey: address.script_pubkey(),
+			};
+
+			// The fee is paid from our channel balance, on top of the amount.
+			let fee_sats = splice_out_fee_sats(&output, funding_feerate_per_kw);
+			let required_msat = splice_amount_sats.saturating_add(fee_sats).saturating_mul(1_000);
+			if required_msat > channel_details.outbound_capacity_msat {
 				log_error!(
 					self.logger,
-					"Failed to splice channel: splice-out of {}sats exceeds outbound capacity of {}msat",
+					"Failed to splice channel: splice-out of {}sats plus a fee of {}sats exceeds outbound capacity of {}msat",
 					splice_amount_sats,
+					fee_sats,
 					channel_details.outbound_capacity_msat,
 				);
-				return Err(Error::ChannelSplicingFailed);
+				return Err(Error::InsufficientFunds);
 			}
 
 			self.wallet.parse_and_validate_address(address)?;
 
-			let contribution = SpliceContribution::SpliceOut {
-				outputs: vec![bitcoin::TxOut {
-					value: Amount::from_sat(splice_amount_sats),
-					script_pubkey: address.script_pubkey(),
-				}],
-			};
+			let contribution = SpliceContribution::SpliceOut { outputs: vec![output] };
 
 			let funding_txo = channel_details.funding_txo.ok_or_else(|| {
 				log_error!(self.logger, "Failed to splice channel: channel not yet ready",);
@@ -1688,8 +1690,9 @@ impl Node {
 					None,
 				)
 				.map_err(|e| {
-					// The fee is paid from the channel balance, so a splice-out that fits our
-					// outbound capacity can still be refused once the fee is added.
+					// LDK checks our balance net of the commitment fee against the post-splice
+					// reserve, rather than our outbound capacity, so a splice-out at the limit can
+					// still be refused here.
 					log_error!(
 						self.logger,
 						"Failed to splice out {}sats at {} sat/kwu: {:?}",

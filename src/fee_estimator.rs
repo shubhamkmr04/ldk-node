@@ -8,11 +8,13 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use bitcoin::FeeRate;
+use bitcoin::constants::WITNESS_SCALE_FACTOR;
+use bitcoin::{FeeRate, TxOut};
 use lightning::chain::chaininterface::{
 	ConfirmationTarget as LdkConfirmationTarget, FeeEstimator as LdkFeeEstimator,
 	FEERATE_FLOOR_SATS_PER_KW,
 };
+use lightning::ln::chan_utils::FUNDING_TRANSACTION_WITNESS_WEIGHT;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum ConfirmationTarget {
@@ -154,6 +156,30 @@ pub(crate) fn is_valid_splice_fee_rate(fee_rate: FeeRate) -> bool {
 	fee_rate.to_sat_per_kwu() >= FEERATE_FLOOR_SATS_PER_KW as u64 && fee_rate <= MAX_SPLICE_FEE_RATE
 }
 
+/// Returns the fee, in sats, that a splice-out paying to `output` at `fee_rate_per_kw` takes from
+/// our channel balance.
+///
+/// As the initiator, we pay for the transaction's common fields, the input spending the current
+/// funding output and the new funding output, along with our own output. This mirrors how LDK
+/// estimates the fee of our contribution when we call `ChannelManager::splice_channel`.
+pub(crate) fn splice_out_fee_sats(output: &TxOut, fee_rate_per_kw: u32) -> u64 {
+	// Version, locktime, input count and output count, plus the segwit marker and flag.
+	const COMMON_FIELDS_WEIGHT: u64 = (4 + 4 + 1 + 1) * WITNESS_SCALE_FACTOR as u64 + 2;
+	// Outpoint, sequence and an empty script_sig, plus the 2-of-2 multisig witness. LDK takes 1 WU
+	// off, as its default `grind_signatures` feature makes our signature a byte shorter.
+	const FUNDING_INPUT_WEIGHT: u64 =
+		(32 + 4 + 4 + 1) * WITNESS_SCALE_FACTOR as u64 + FUNDING_TRANSACTION_WITNESS_WEIGHT - 1;
+	// Value, script length and a P2WSH script.
+	const FUNDING_OUTPUT_WEIGHT: u64 = (8 + 1 + 34) * WITNESS_SCALE_FACTOR as u64;
+
+	let weight = COMMON_FIELDS_WEIGHT
+		+ FUNDING_INPUT_WEIGHT
+		+ FUNDING_OUTPUT_WEIGHT
+		+ output.weight().to_wu();
+	// Rounded up, as LDK does.
+	(u64::from(fee_rate_per_kw) * weight).div_ceil(1000)
+}
+
 pub(crate) fn get_all_conf_targets() -> [ConfirmationTarget; 10] {
 	[
 		ConfirmationTarget::OnchainPayment,
@@ -209,10 +235,11 @@ pub(crate) fn apply_post_estimation_adjustments(
 
 #[cfg(test)]
 mod tests {
-	use bitcoin::FeeRate;
+	use bitcoin::hashes::Hash;
+	use bitcoin::{Amount, FeeRate, ScriptBuf, TxOut, WPubkeyHash, WScriptHash};
 	use lightning::chain::chaininterface::FEERATE_FLOOR_SATS_PER_KW;
 
-	use super::{is_valid_splice_fee_rate, MAX_SPLICE_FEE_RATE};
+	use super::{is_valid_splice_fee_rate, splice_out_fee_sats, MAX_SPLICE_FEE_RATE};
 
 	#[test]
 	fn splice_fee_rate_must_be_within_floor_and_max() {
@@ -230,5 +257,25 @@ mod tests {
 	fn splice_fee_rate_in_sat_per_vb_instead_of_sat_per_kw_is_refused() {
 		let floor = FEERATE_FLOOR_SATS_PER_KW as u64;
 		assert!(!is_valid_splice_fee_rate(FeeRate::from_sat_per_vb_unchecked(floor)));
+	}
+
+	#[test]
+	fn splice_out_fee_covers_our_share_of_the_splice_transaction() {
+		// We pay for 597 WU of the splice transaction, plus our own output.
+		let p2wpkh_output = TxOut {
+			value: Amount::from_sat(100_000),
+			script_pubkey: ScriptBuf::new_p2wpkh(&WPubkeyHash::all_zeros()),
+		};
+		assert_eq!(p2wpkh_output.weight().to_wu(), 124);
+		// 721 WU at 2,500 sat/kW is 1,802.5 sats, and at 253 sat/kW 182.413 sats, rounded up.
+		assert_eq!(splice_out_fee_sats(&p2wpkh_output, 2_500), 1_803);
+		assert_eq!(splice_out_fee_sats(&p2wpkh_output, 253), 183);
+
+		let p2wsh_output = TxOut {
+			value: Amount::from_sat(100_000),
+			script_pubkey: ScriptBuf::new_p2wsh(&WScriptHash::all_zeros()),
+		};
+		assert_eq!(p2wsh_output.weight().to_wu(), 172);
+		assert_eq!(splice_out_fee_sats(&p2wsh_output, 2_500), 1_923);
 	}
 }
