@@ -747,11 +747,16 @@ impl Wallet {
 			.input
 			.iter()
 			.filter(|txin| must_spend.iter().all(|input| input.outpoint != txin.previous_output))
-			.filter_map(|txin| {
-				locked_wallet
-					.tx_details(txin.previous_output.txid)
-					.map(|tx_details| tx_details.tx.deref().clone())
-					.map(|prevtx| FundingTxInput::new_p2wpkh(prevtx, txin.previous_output.vout))
+			.map(|txin| {
+				let tx_details =
+					locked_wallet.tx_details(txin.previous_output.txid).ok_or_else(|| {
+						log_error!(
+							self.logger,
+							"Failed to select confirmed UTXOs: missing parent transaction of {}",
+							txin.previous_output
+						);
+					})?;
+				FundingTxInput::new_p2wpkh(tx_details.tx.deref().clone(), txin.previous_output.vout)
 			})
 			.collect::<Result<Vec<_>, ()>>()
 			.map_err(|()| Error::OnchainTxCreationFailed)
