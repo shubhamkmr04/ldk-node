@@ -3,9 +3,10 @@
 ## Feature and API updates
 - `Node::splice_in` and `Node::splice_out` now take an optional `min_fee_rate`. If set, it is
   used as the feerate for our contribution to the splice transaction instead of a feerate estimate
-  retrieved from the configured chain source. As a splice can't be fee-bumped, a feerate below
-  253 sat/kW or above our current maximum fee estimate is rejected with
-  `NodeError::InvalidFeeRate`. (#1159)
+  retrieved from the configured chain source. On this release line it is the exact feerate, as
+  the splice is never negotiated at a higher one. As a splice can't be fee-bumped, a feerate below
+  253 sat/kW or above 62,500 sat/kW (250 sat/vB) is rejected with `NodeError::InvalidFeeRate`.
+  (#1159)
 
 ## Bug Fixes and Improvements
 - While a splice is pending, `Node::list_balances` now reports each channel's balance from its
@@ -13,7 +14,8 @@
 - `Node::splice_in` and `Node::splice_out` now fail with `NodeError::NotRunning` if the node is
   not running, instead of queuing a splice that never happens.
 - `Node::splice_in` now fails with `NodeError::InsufficientFunds` instead of
-  `NodeError::ChannelSplicingFailed` if our confirmed funds can't cover the fee.
+  `NodeError::ChannelSplicingFailed` if our confirmed funds can't cover the fee, and
+  `Node::splice_out` does so if our outbound capacity can't cover the amount plus the fee.
 
 ## Compatibility Notes
 - The new `min_fee_rate` argument of `Node::splice_in` and `Node::splice_out` is required, so
