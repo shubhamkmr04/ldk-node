@@ -1205,16 +1205,17 @@ async fn splice_channel_with_fee_rate() {
 	expect_channel_ready_event!(node_b, node_a.node_id());
 
 	// Ten times the feerate our chain source estimates on regtest, so a splice that ignored the
-	// requested feerate would be easy to tell apart.
+	// requested feerate would be easy to tell apart. It only has to stay within the fixed bounds of
+	// a requested feerate, not near any estimate.
 	let fee_rate = FeeRate::from_sat_per_kwu(2_500);
 
 	let address = node_a.onchain_payment().new_address().unwrap();
 
-	// As a splice can't be fee-bumped, a feerate below the floor is refused so it confirms, and one
-	// far above our maximum fee estimate is refused as an overpayment.
+	// As a splice can't be fee-bumped, a feerate below the floor is refused so it confirms, and the
+	// same feerate given in sat/vB instead of sat/kW is refused as an overpayment.
 	let below_floor_fee_rate = FeeRate::from_sat_per_kwu(FEERATE_FLOOR_SATS_PER_KW as u64 - 1);
-	let above_max_fee_rate = FeeRate::from_sat_per_kwu(1_000_000);
-	for invalid_fee_rate in [below_floor_fee_rate, above_max_fee_rate] {
+	let wrong_unit_fee_rate = FeeRate::from_sat_per_vb_unchecked(fee_rate.to_sat_per_kwu());
+	for invalid_fee_rate in [below_floor_fee_rate, wrong_unit_fee_rate] {
 		assert_eq!(
 			node_a.splice_out(
 				&user_channel_id_a,

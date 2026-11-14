@@ -134,7 +134,8 @@ use error::Error;
 pub use event::Event;
 use event::{EventHandler, EventQueue};
 use fee_estimator::{
-	is_valid_splice_fee_rate, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator,
+	get_fallback_rate_for_target, is_valid_splice_fee_rate, ConfirmationTarget, FeeEstimator,
+	OnchainFeeEstimator, MAX_SPLICE_FEE_RATE,
 };
 #[cfg(feature = "uniffi")]
 use ffi::*;
@@ -142,9 +143,7 @@ use ffi::{maybe_map_fee_rate_opt, FfiFeeRate};
 use gossip::GossipSource;
 use graph::NetworkGraph;
 use io::utils::write_node_metrics;
-use lightning::chain::chaininterface::{
-	ConfirmationTarget as LdkConfirmationTarget, FEERATE_FLOOR_SATS_PER_KW,
-};
+use lightning::chain::chaininterface::FEERATE_FLOOR_SATS_PER_KW;
 use lightning::chain::BestBlock;
 use lightning::events::bump_transaction::{Input, Wallet as LdkWallet};
 use lightning::impl_writeable_tlv_based;
@@ -1454,21 +1453,18 @@ impl Node {
 	/// Returns the feerate, in sat/kW, for a splice we initiate: `min_fee_rate` if set, otherwise
 	/// our [`ConfirmationTarget::ChannelFunding`] estimate.
 	///
-	/// Returns [`Error::InvalidFeeRate`] if `min_fee_rate` is below 253 sat/kW or above our current
-	/// [`LdkConfirmationTarget::MaximumFeeEstimate`].
+	/// Returns [`Error::InvalidFeeRate`] if `min_fee_rate` is below 253 sat/kW or above
+	/// [`MAX_SPLICE_FEE_RATE`].
 	fn resolve_splice_fee_rate(&self, min_fee_rate: Option<FfiFeeRate>) -> Result<u32, Error> {
 		let fee_rate = match maybe_map_fee_rate_opt(min_fee_rate) {
 			Some(fee_rate) => {
-				let max_fee_rate = self
-					.fee_estimator
-					.estimate_fee_rate(LdkConfirmationTarget::MaximumFeeEstimate.into());
-				if !is_valid_splice_fee_rate(fee_rate, max_fee_rate) {
+				if !is_valid_splice_fee_rate(fee_rate) {
 					log_error!(
 						self.logger,
 						"Failed to splice channel: fee rate of {} sat/kwu is outside {}..={} sat/kwu",
 						fee_rate.to_sat_per_kwu(),
 						FEERATE_FLOOR_SATS_PER_KW,
-						max_fee_rate.to_sat_per_kwu()
+						MAX_SPLICE_FEE_RATE.to_sat_per_kwu()
 					);
 					return Err(Error::InvalidFeeRate);
 				}
@@ -1476,7 +1472,18 @@ impl Node {
 			},
 			None => self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding),
 		};
-		Ok(fee_rate.to_sat_per_kwu().try_into().unwrap_or(u32::MAX))
+		// Only an estimate can exceed `u32`: a requested feerate is at most `MAX_SPLICE_FEE_RATE`.
+		Ok(fee_rate.to_sat_per_kwu().try_into().unwrap_or_else(|_| {
+			let fallback_rate = get_fallback_rate_for_target(ConfirmationTarget::ChannelFunding);
+			log_error!(
+				self.logger,
+				"Splice fee rate estimate of {} sat/kwu is out of range, using {} sat/kwu instead",
+				fee_rate.to_sat_per_kwu(),
+				fallback_rate
+			);
+			debug_assert!(false);
+			fallback_rate
+		}))
 	}
 
 	/// Add funds from the on-chain wallet into an existing channel.
@@ -1486,9 +1493,10 @@ impl Node {
 	/// while waiting for a new funding transaction to confirm.
 	///
 	/// If `min_fee_rate` is set, it will be used as the feerate for our contribution to the splice
-	/// transaction instead of a feerate estimate retrieved from the configured chain source. As a
-	/// splice can't be fee-bumped, returns [`Error::InvalidFeeRate`] if it is below 253 sat/kW,
-	/// the floor applied to our estimates, or above our current maximum fee estimate.
+	/// transaction instead of a feerate estimate retrieved from the configured chain source.
+	/// Despite the name, it is the exact feerate: the splice is never negotiated at a higher one.
+	/// As a splice can't be fee-bumped, returns [`Error::InvalidFeeRate`] if it is below
+	/// 253 sat/kW, the floor applied to our estimates, or above 62,500 sat/kW (250 sat/vB).
 	///
 	/// # Experimental API
 	///
@@ -1537,7 +1545,7 @@ impl Node {
 				script_pubkey: funding_output.script_pubkey.clone(),
 			};
 
-			let fee_rate = bitcoin::FeeRate::from_sat_per_kwu(funding_feerate_per_kw as u64);
+			let fee_rate = bitcoin::FeeRate::from_sat_per_kwu(u64::from(funding_feerate_per_kw));
 
 			let inputs = self
 				.wallet
@@ -1613,9 +1621,10 @@ impl Node {
 	/// while waiting for a new funding transaction to confirm.
 	///
 	/// If `min_fee_rate` is set, it will be used as the feerate for our contribution to the splice
-	/// transaction instead of a feerate estimate retrieved from the configured chain source. As a
-	/// splice can't be fee-bumped, returns [`Error::InvalidFeeRate`] if it is below 253 sat/kW,
-	/// the floor applied to our estimates, or above our current maximum fee estimate.
+	/// transaction instead of a feerate estimate retrieved from the configured chain source.
+	/// Despite the name, it is the exact feerate: the splice is never negotiated at a higher one.
+	/// As a splice can't be fee-bumped, returns [`Error::InvalidFeeRate`] if it is below
+	/// 253 sat/kW, the floor applied to our estimates, or above 62,500 sat/kW (250 sat/vB).
 	///
 	/// # Experimental API
 	///
