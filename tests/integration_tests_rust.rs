@@ -151,6 +151,100 @@ async fn channel_open_fails_when_funds_insufficient() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn open_channel_fee_does_not_spend_anchor_reserve() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
+
+	// Node B needs funds of its own to retain an anchor reserve, otherwise it rejects the anchor
+	// channel and we fall back to a channel type without one.
+	let premine_amount_sat = 1_000_000;
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![
+			node_a.onchain_payment().new_address().unwrap(),
+			node_b.onchain_payment().new_address().unwrap(),
+		],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	// The channel amount and the anchor reserve fit in our funds, but leave only 50 sats for the
+	// funding transaction's fee of about 150 sats, so the rest would come out of the reserve.
+	let anchor_reserve_sat = 25_000;
+	let channel_amount_sat = premine_amount_sat - anchor_reserve_sat - 50;
+	let address_b = node_b.listening_addresses().unwrap().first().unwrap().clone();
+	assert_eq!(
+		Err(NodeError::InsufficientFunds),
+		node_a.open_channel(node_b.node_id(), address_b.clone(), channel_amount_sat, None, None)
+	);
+	assert!(node_a.list_channels().is_empty());
+
+	// With room for the fee, the channel opens and the reserve stays on-chain.
+	node_a
+		.open_channel(node_b.node_id(), address_b, channel_amount_sat - 1_000, None, None)
+		.unwrap();
+	let funding_txo = expect_channel_pending_event!(node_a, node_b.node_id());
+	expect_channel_pending_event!(node_b, node_a.node_id());
+	wait_for_tx(&electrsd.client, funding_txo.txid).await;
+
+	node_a.sync_wallets().unwrap();
+	let balances = node_a.list_balances();
+	assert!(
+		balances.total_onchain_balance_sats >= anchor_reserve_sat,
+		"the funding transaction left {}sats on-chain, less than the {}sats anchor reserve",
+		balances.total_onchain_balance_sats,
+		anchor_reserve_sat,
+	);
+	assert_eq!(balances.total_anchor_channels_reserve_sats, anchor_reserve_sat);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn open_channel_fund_max_without_anchor_reserve() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	// Node B trusts node A, so retains no anchor reserve for their channel. Node A doesn't, so needs
+	// funds of its own to accept it.
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, true);
+
+	let premine_amount_sat = 1_000_000;
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![
+			node_a.onchain_payment().new_address().unwrap(),
+			node_b.onchain_payment().new_address().unwrap(),
+		],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	// Funding with all of our funds is the most the funding fee check allows, so it must pass.
+	let address_a = node_a.listening_addresses().unwrap().first().unwrap().clone();
+	node_b.open_channel_fund_max(node_a.node_id(), address_a, None, None, None).unwrap();
+	let funding_txo = expect_channel_pending_event!(node_b, node_a.node_id());
+	expect_channel_pending_event!(node_a, node_b.node_id());
+	wait_for_tx(&electrsd.client, funding_txo.txid).await;
+
+	node_b.sync_wallets().unwrap();
+	let channel = node_b.list_channels().into_iter().next().unwrap();
+	assert_eq!(channel.counterparty_node_id, node_a.node_id());
+	assert!(channel.channel_value_sats > premine_amount_sat - 1_000);
+	assert_eq!(node_b.list_balances().total_onchain_balance_sats, 0);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn multi_hop_sending() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());

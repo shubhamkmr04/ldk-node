@@ -1268,6 +1268,11 @@ impl Node {
 	/// [`AnchorChannelsConfig::per_channel_reserve_sats`] is available and will be retained before
 	/// opening the channel.
 	///
+	/// As the funding transaction's fee is paid from the same on-chain funds, `channel_amount_sats`
+	/// can be at most what funding the channel with all of them would add at our fee estimate for
+	/// channel funding, while retaining the anchor reserve. Otherwise, this fails with
+	/// [`Error::InsufficientFunds`].
+	///
 	/// Returns a [`UserChannelId`] allowing to locally keep track of the channel.
 	///
 	/// [`AnchorChannelsConfig::per_channel_reserve_sats`]: crate::config::AnchorChannelsConfig::per_channel_reserve_sats
@@ -1303,6 +1308,11 @@ impl Node {
 	/// [`AnchorChannelsConfig::per_channel_reserve_sats`] is available and will be retained before
 	/// opening the channel.
 	///
+	/// As the funding transaction's fee is paid from the same on-chain funds, `channel_amount_sats`
+	/// can be at most what funding the channel with all of them would add at our fee estimate for
+	/// channel funding, while retaining the anchor reserve. Otherwise, this fails with
+	/// [`Error::InsufficientFunds`].
+	///
 	/// Returns a [`UserChannelId`] allowing to locally keep track of the channel.
 	///
 	/// [`AnchorChannelsConfig::per_channel_reserve_sats`]: crate::config::AnchorChannelsConfig::per_channel_reserve_sats
@@ -1329,6 +1339,11 @@ impl Node {
 
 	/// Connect to a node and open a new unannounced channel using only the specified UTXOs
 	/// for the funding transaction.
+	///
+	/// As the funding transaction's fee is paid from the same on-chain funds, `channel_amount_sats`
+	/// can be at most what funding the channel with all of them would add at our fee estimate for
+	/// channel funding, while retaining the anchor reserve. Otherwise, this fails with
+	/// [`Error::InsufficientFunds`].
 	pub fn open_channel_with_utxos(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
@@ -1348,6 +1363,11 @@ impl Node {
 
 	/// Connect to a node and open a new announced channel using only the specified UTXOs
 	/// for the funding transaction.
+	///
+	/// As the funding transaction's fee is paid from the same on-chain funds, `channel_amount_sats`
+	/// can be at most what funding the channel with all of them would add at our fee estimate for
+	/// channel funding, while retaining the anchor reserve. Otherwise, this fails with
+	/// [`Error::InsufficientFunds`].
 	pub fn open_announced_channel_with_utxos(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
