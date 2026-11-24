@@ -1133,8 +1133,12 @@ impl Node {
 			con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
 		})?;
 
-		// Check funds availability after connection (includes anchor reserve calculation)
-		self.check_sufficient_onchain_funds(channel_amount_sats, &node_id, true)?;
+		// Check funds availability after connection (includes anchor reserve and funding fee
+		// calculation). Once the channel is negotiated, the funding transaction is built at our
+		// `ChannelFunding` estimate.
+		let funding_fee_rate =
+			self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+		self.check_sufficient_onchain_funds(channel_amount_sats, &node_id, Some(funding_fee_rate))?;
 
 		let mut user_config = default_user_config(&self.config);
 		user_config.channel_handshake_config.announce_for_forwarding = announce_for_forwarding;
@@ -1176,9 +1180,14 @@ impl Node {
 	}
 
 	fn check_sufficient_onchain_funds(
-		&self, amount_sats: u64, peer_node_id: &PublicKey, for_new_channel: bool,
+		&self, amount_sats: u64, peer_node_id: &PublicKey,
+		new_channel_with_funding_fee_rate: Option<bitcoin::FeeRate>,
 	) -> Result<(), Error> {
-		let action_str = if for_new_channel { "create channel" } else { "splice-in" };
+		let action_str = if new_channel_with_funding_fee_rate.is_some() {
+			"create channel"
+		} else {
+			"splice-in"
+		};
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 		let spendable_amount_sats =
@@ -1195,7 +1204,7 @@ impl Node {
 			return Err(Error::InsufficientFunds);
 		}
 
-		if for_new_channel {
+		if let Some(fee_rate) = new_channel_with_funding_fee_rate {
 			// Fail if we have less than the channel value + anchor reserve available (if
 			// applicable).
 			let init_features = self
@@ -1203,8 +1212,8 @@ impl Node {
 				.peer_by_node_id(peer_node_id)
 				.ok_or(Error::ConnectionFailed)?
 				.init_features;
-			let required_funds_sats = amount_sats
-				+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
+			let new_channel_reserve_sats =
+				self.config.anchor_channels_config.as_ref().map_or(0, |c| {
 					if init_features.supports_anchors_zero_fee_htlc_tx()
 						&& !c.trusted_peers_no_reserve.contains(peer_node_id)
 					{
@@ -1213,11 +1222,30 @@ impl Node {
 						0
 					}
 				});
+			let required_funds_sats = amount_sats + new_channel_reserve_sats;
 
 			if spendable_amount_sats < required_funds_sats {
 				log_error!(self.logger,
 					"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
 					spendable_amount_sats, required_funds_sats
+				);
+				return Err(Error::InsufficientFunds);
+			}
+
+			// The funding transaction's fee is paid from the same on-chain funds, so we can't
+			// fund more than we would when opening the channel with all of them.
+			let total_anchor_reserve_sats =
+				cur_anchor_reserve_sats.saturating_add(new_channel_reserve_sats);
+			let max_amount =
+				self.wallet.get_max_funding_amount(total_anchor_reserve_sats, fee_rate)?;
+			if amount_sats > max_amount {
+				log_error!(
+					self.logger,
+					"Unable to create channel due to insufficient funds. Requested: {}sats, Maximum: {}sats (fee rate: {} sat/kw, anchor reserve: {}sats)",
+					amount_sats,
+					max_amount,
+					fee_rate.to_sat_per_kwu(),
+					total_anchor_reserve_sats,
 				);
 				return Err(Error::InsufficientFunds);
 			}
@@ -1517,7 +1545,7 @@ impl Node {
 		if let Some(channel_details) =
 			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
 		{
-			self.check_sufficient_onchain_funds(splice_amount_sats, &counterparty_node_id, false)?;
+			self.check_sufficient_onchain_funds(splice_amount_sats, &counterparty_node_id, None)?;
 
 			const EMPTY_SCRIPT_SIG_WEIGHT: u64 =
 				1 /* empty script_sig */ * bitcoin::constants::WITNESS_SCALE_FACTOR as u64;

@@ -369,6 +369,77 @@ impl Wallet {
 		Ok(funding_amount)
 	}
 
+	/// Returns the maximum amount a channel funding transaction at `fee_rate` could fund with all
+	/// of our funds, while retaining `cur_anchor_reserve_sats`.
+	pub(crate) fn get_max_funding_amount(
+		&self, cur_anchor_reserve_sats: u64, fee_rate: FeeRate,
+	) -> Result<u64, Error> {
+		let mut locked_wallet = self.inner.lock().unwrap();
+
+		let balance = locked_wallet.balance();
+		let spendable_amount_sats =
+			self.get_balances_inner(balance, cur_anchor_reserve_sats).map(|(_, s)| s).unwrap_or(0);
+		if spendable_amount_sats == 0 {
+			log_error!(
+				self.logger,
+				"Unable to determine max funding amount: no spendable funds available."
+			);
+			return Err(Error::InsufficientFunds);
+		}
+
+		const DUST_LIMIT_SATS: u64 = 546;
+		let anchor_address = if cur_anchor_reserve_sats > DUST_LIMIT_SATS {
+			Some(locked_wallet.peek_address(KeychainKind::Internal, 0))
+		} else {
+			None
+		};
+
+		// Use a dummy P2WSH script (34 bytes) to match the size of a real funding output.
+		let dummy_p2wsh_script = ScriptBuf::new().to_p2wsh();
+
+		let mut tx_builder = locked_wallet.build_tx();
+		tx_builder.drain_wallet().drain_to(dummy_p2wsh_script.clone()).fee_rate(fee_rate);
+		if let Some(address_info) = anchor_address {
+			tx_builder.add_recipient(
+				address_info.address.script_pubkey(),
+				Amount::from_sat(cur_anchor_reserve_sats),
+			);
+		}
+
+		let psbt = tx_builder.finish().map_err(|err| {
+			log_error!(self.logger, "Failed to create temporary drain transaction: {}", err);
+			err
+		})?;
+
+		// Note we intentionally don't `cancel_tx` the temporary transaction: draining to a fixed
+		// script means BDK neither reserves a change address nor locks inputs for it. Cancelling it
+		// would instead clear the usage mark on the anchor reserve placeholder address, which a
+		// pending transaction may have reserved as its change address, leading to address reuse.
+
+		let max_amount = psbt
+			.unsigned_tx
+			.output
+			.iter()
+			.find(|o| o.script_pubkey == dummy_p2wsh_script)
+			.map(|o| o.value.to_sat())
+			.ok_or_else(|| {
+				log_error!(self.logger, "Failed to find drain output in temporary transaction");
+				Error::InsufficientFunds
+			})?;
+
+		if max_amount < DUST_LIMIT_SATS {
+			log_error!(
+				self.logger,
+				"Unable to proceed: available funds would be consumed entirely by fees. Available: {}sats, drain output: {}sats.",
+				spendable_amount_sats,
+				max_amount,
+			);
+			return Err(Error::InsufficientFunds);
+		}
+
+		Ok(max_amount)
+	}
+
 	pub(crate) fn get_new_address(&self) -> Result<bitcoin::Address, Error> {
 		let mut locked_wallet = self.inner.lock().unwrap();
 		let mut locked_persister = self.persister.lock().unwrap();
