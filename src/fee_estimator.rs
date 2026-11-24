@@ -351,10 +351,7 @@ mod tests {
 	fn splice_in_wallet_spend_drops_change_left_at_dust_after_its_own_fee() {
 		// 478 sats left pays 124 sats for the change output, which leaves the dust limit of 354
 		// sats, so the change is dropped.
-		assert_eq!(
-			splice_in_wallet_spend_sats(100_000, 1, 100_000 - 868 - 478, 1_000),
-			100_000
-		);
+		assert_eq!(splice_in_wallet_spend_sats(100_000, 1, 100_000 - 868 - 478, 1_000), 100_000);
 		// One more sat and the change is kept.
 		assert_eq!(
 			splice_in_wallet_spend_sats(100_000, 1, 100_000 - 868 - 479, 1_000),
