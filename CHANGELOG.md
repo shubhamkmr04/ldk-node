@@ -21,6 +21,8 @@
   channel with all of our on-chain funds would add at our fee estimate. Previously, a high fee
   estimate could spend part of the anchor reserve, or the funding transaction could fail to be
   built after the channel had already been negotiated. (#1204)
+- When acting as an LSPS2 service, we likewise account for the funding transaction's fee when
+  checking that a JIT channel can be opened while retaining the anchor reserve. (#1204)
 
 ## Compatibility Notes
 - The new `min_fee_rate` argument of `Node::splice_in` and `Node::splice_out` is required, so

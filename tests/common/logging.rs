@@ -168,3 +168,35 @@ impl LogWriter for MultiNodeLogger {
 		print!("{}", log);
 	}
 }
+
+/// Collects the messages a node logs, so tests can check for a specific one.
+pub(crate) struct CollectingLogWriter {
+	logs: Mutex<Vec<String>>,
+}
+
+impl CollectingLogWriter {
+	pub(crate) fn new() -> Self {
+		Self { logs: Mutex::new(Vec::new()) }
+	}
+
+	pub(crate) fn contains(&self, text: &str) -> bool {
+		self.logs.lock().unwrap().iter().any(|message| message.contains(text))
+	}
+
+	/// Waits up to a minute for a logged message containing `text`, returning whether one arrived.
+	pub(crate) async fn wait_for(&self, text: &str) -> bool {
+		for _ in 0..600 {
+			if self.contains(text) {
+				return true;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+		}
+		false
+	}
+}
+
+impl LogWriter for CollectingLogWriter {
+	fn log(&self, record: LogRecord) {
+		self.logs.lock().unwrap().push(record.args.to_string());
+	}
+}

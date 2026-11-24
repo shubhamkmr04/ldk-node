@@ -45,6 +45,7 @@ use tokio::sync::oneshot;
 use crate::builder::BuildError;
 use crate::chain::ChainSource;
 use crate::connection::ConnectionManager;
+use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
 use crate::runtime::Runtime;
 use crate::types::{
@@ -181,6 +182,7 @@ where
 	keys_manager: Arc<KeysManager>,
 	chain_source: Arc<ChainSource>,
 	tx_broadcaster: Arc<Broadcaster>,
+	fee_estimator: Arc<OnchainFeeEstimator>,
 	kv_store: Arc<DynStore>,
 	config: Arc<Config>,
 	logger: L,
@@ -192,8 +194,9 @@ where
 {
 	pub(crate) fn new(
 		wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
-		chain_source: Arc<ChainSource>, tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>,
-		config: Arc<Config>, logger: L,
+		chain_source: Arc<ChainSource>, tx_broadcaster: Arc<Broadcaster>,
+		fee_estimator: Arc<OnchainFeeEstimator>, kv_store: Arc<DynStore>, config: Arc<Config>,
+		logger: L,
 	) -> Self {
 		let lsps1_client = None;
 		let lsps2_client = None;
@@ -209,6 +212,7 @@ where
 			keys_manager,
 			chain_source,
 			tx_broadcaster,
+			fee_estimator,
 			kv_store,
 			config,
 			logger,
@@ -320,6 +324,7 @@ where
 			lsps2_service: self.lsps2_service,
 			lsps7_client: self.lsps7_client,
 			wallet: self.wallet,
+			fee_estimator: self.fee_estimator,
 			channel_manager: self.channel_manager,
 			peer_manager: RwLock::new(None),
 			keys_manager: self.keys_manager,
@@ -339,6 +344,7 @@ where
 	lsps2_service: Option<LSPS2Service>,
 	lsps7_client: Option<LSPS7Client>,
 	wallet: Arc<Wallet>,
+	fee_estimator: Arc<OnchainFeeEstimator>,
 	channel_manager: Arc<ChannelManager>,
 	peer_manager: RwLock<Option<Arc<PeerManager>>>,
 	keys_manager: Arc<KeysManager>,
@@ -800,8 +806,8 @@ where
 					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 				let spendable_amount_sats =
 					self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
-				let required_funds_sats = channel_amount_sats
-					+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
+				let additional_reserve_required =
+					self.config.anchor_channels_config.as_ref().map_or(0, |c| {
 						if init_features.supports_anchors_zero_fee_htlc_tx()
 							&& !c.trusted_peers_no_reserve.contains(&their_network_key)
 						{
@@ -810,6 +816,7 @@ where
 							0
 						}
 					});
+				let required_funds_sats = channel_amount_sats + additional_reserve_required;
 				if spendable_amount_sats < required_funds_sats {
 					log_error!(self.logger,
 						"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
@@ -818,6 +825,34 @@ where
 					// TODO: We just silently fail here. Eventually we will need to remember
 					// the pending requests and regularly retry opening the channel until we
 					// succeed.
+					return;
+				}
+
+				// The funding transaction's fee is paid from the same on-chain funds, so we can't
+				// fund more than we would when opening a channel with all of them.
+				let total_anchor_reserve_sats =
+					cur_anchor_reserve_sats.saturating_add(additional_reserve_required);
+				let funding_fee_rate =
+					self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+				let max_amount = match self
+					.wallet
+					.get_max_funding_amount(total_anchor_reserve_sats, funding_fee_rate)
+				{
+					Ok(max_amount) => max_amount,
+					Err(e) => {
+						log_error!(
+							self.logger,
+							"Unable to create channel as the maximum funding amount couldn't be determined: {:?}",
+							e,
+						);
+						return;
+					},
+				};
+				if channel_amount_sats > max_amount {
+					log_error!(self.logger,
+						"Unable to create channel due to insufficient funds. Requested: {}sats, Maximum: {}sats (fee rate: {} sat/kw, anchor reserve: {}sats)",
+						channel_amount_sats, max_amount, funding_fee_rate.to_sat_per_kwu(), total_anchor_reserve_sats,
+					);
 					return;
 				}
 
