@@ -512,6 +512,14 @@ impl Wallet {
 		self.get_balances(total_anchor_channels_reserve_sats).map(|(_, s)| s)
 	}
 
+	/// Returns the value of our confirmed, unspent outputs, the only ones coin selection for a
+	/// splice may spend.
+	///
+	/// Unlike [`Self::get_spendable_amount_sats`], this leaves out unconfirmed change.
+	pub(crate) fn get_confirmed_amount_sats(&self) -> u64 {
+		self.inner.lock().unwrap().balance().confirmed.to_sat()
+	}
+
 	pub(crate) fn list_utxos(&self) -> Result<Vec<crate::WalletUtxo>, Error> {
 		let locked_wallet = self.inner.lock().unwrap();
 		let network = self.config.network;
@@ -772,11 +780,11 @@ impl Wallet {
 		Ok(txid)
 	}
 
-	/// Returns [`Error::InsufficientFunds`] if our confirmed UTXOs can't cover `must_pay_to` plus
-	/// the fee at `fee_rate`.
+	/// Returns the selected inputs along with their total value, or [`Error::InsufficientFunds`] if
+	/// our confirmed UTXOs can't cover `must_pay_to` plus the fee at `fee_rate`.
 	pub(crate) fn select_confirmed_utxos(
 		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
-	) -> Result<Vec<FundingTxInput>, Error> {
+	) -> Result<(Vec<FundingTxInput>, u64), Error> {
 		let mut locked_wallet = self.inner.lock().unwrap();
 		debug_assert!(matches!(
 			locked_wallet.public_descriptor(KeychainKind::External),
@@ -808,7 +816,7 @@ impl Wallet {
 		tx_builder.fee_rate(fee_rate);
 		tx_builder.exclude_unconfirmed();
 
-		tx_builder
+		let (inputs, input_values_sats): (Vec<_>, Vec<_>) = tx_builder
 			.finish()
 			.map_err(|e| {
 				log_error!(self.logger, "Failed to select confirmed UTXOs: {}", e);
@@ -827,10 +835,17 @@ impl Wallet {
 							txin.previous_output
 						);
 					})?;
-				FundingTxInput::new_p2wpkh(tx_details.tx.deref().clone(), txin.previous_output.vout)
+				let prevtx = tx_details.tx.deref().clone();
+				let vout = txin.previous_output.vout;
+				let value_sats = prevtx.output.get(vout as usize).map_or(0, |o| o.value.to_sat());
+				FundingTxInput::new_p2wpkh(prevtx, vout).map(|input| (input, value_sats))
 			})
 			.collect::<Result<Vec<_>, ()>>()
-			.map_err(|()| Error::OnchainTxCreationFailed)
+			.map_err(|()| Error::OnchainTxCreationFailed)?
+			.into_iter()
+			.unzip();
+
+		Ok((inputs, input_values_sats.into_iter().sum()))
 	}
 
 	fn list_confirmed_utxos_inner(&self) -> Result<Vec<Utxo>, ()> {

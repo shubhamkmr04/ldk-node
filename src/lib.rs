@@ -134,8 +134,9 @@ use error::Error;
 pub use event::Event;
 use event::{EventHandler, EventQueue};
 use fee_estimator::{
-	get_fallback_rate_for_target, is_valid_splice_fee_rate, splice_out_fee_sats,
-	ConfirmationTarget, FeeEstimator, OnchainFeeEstimator, MAX_SPLICE_FEE_RATE,
+	get_fallback_rate_for_target, is_valid_splice_fee_rate, splice_in_wallet_spend_sats,
+	splice_out_fee_sats, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator,
+	MAX_SPLICE_FEE_RATE,
 };
 #[cfg(feature = "uniffi")]
 use ffi::*;
@@ -1190,8 +1191,13 @@ impl Node {
 		};
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
-		let spendable_amount_sats =
-			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+		let spendable_amount_sats = if new_channel_with_funding_fee_rate.is_some() {
+			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0)
+		} else {
+			// A splice-in only spends confirmed outputs, so check against those, as we do again
+			// once its fee is known.
+			self.wallet.get_confirmed_amount_sats().saturating_sub(cur_anchor_reserve_sats)
+		};
 
 		if spendable_amount_sats < amount_sats {
 			log_error!(
@@ -1546,6 +1552,10 @@ impl Node {
 	/// As a splice can't be fee-bumped, returns [`Error::InvalidFeeRate`] if it is below
 	/// 253 sat/kW, the floor applied to our estimates, or above 62,500 sat/kW (250 sat/vB).
 	///
+	/// The fee for our contribution is paid from the same on-chain funds as `splice_amount_sats`.
+	/// Together, they must fit within our confirmed on-chain funds beyond the anchor reserve, or
+	/// this fails with [`Error::InsufficientFunds`].
+	///
 	/// # Experimental API
 	///
 	/// This API is experimental. Currently, a splice-in will be marked as an outbound payment, but
@@ -1595,7 +1605,7 @@ impl Node {
 
 			let fee_rate = bitcoin::FeeRate::from_sat_per_kwu(u64::from(funding_feerate_per_kw));
 
-			let inputs = self
+			let (inputs, inputs_sats) = self
 				.wallet
 				.select_confirmed_utxos(vec![shared_input], &[shared_output], fee_rate)
 				.map_err(|e| match e {
@@ -1613,6 +1623,29 @@ impl Node {
 						Error::ChannelSplicingFailed
 					},
 				})?;
+
+			// The fee for our contribution is paid from the same on-chain funds as the amount, and
+			// coin selection doesn't keep the anchor reserve aside. As LDK negotiates the splice at
+			// exactly this feerate, what it takes from our wallet is known now.
+			let required_funds_sats = splice_in_wallet_spend_sats(
+				inputs_sats,
+				inputs.len(),
+				splice_amount_sats,
+				funding_feerate_per_kw,
+			);
+			let cur_anchor_reserve_sats =
+				total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+			let available_funds_sats =
+				self.wallet.get_confirmed_amount_sats().saturating_sub(cur_anchor_reserve_sats);
+			if required_funds_sats > available_funds_sats {
+				log_error!(
+					self.logger,
+					"Unable to splice-in due to insufficient funds. Available: {}sats, Required: {}sats (including fees)",
+					available_funds_sats,
+					required_funds_sats,
+				);
+				return Err(Error::InsufficientFunds);
+			}
 
 			// insert channel's funding utxo into the wallet so we can later calculate fees
 			// correctly when viewing this splice-in.

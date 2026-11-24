@@ -16,6 +16,8 @@
 - `Node::splice_in` now fails with `NodeError::InsufficientFunds` instead of
   `NodeError::ChannelSplicingFailed` if our confirmed funds can't cover the fee, and
   `Node::splice_out` does so if our outbound capacity can't cover the amount plus the fee.
+  `Node::splice_in` likewise does so if the fee would spend part of the anchor reserve, which it
+  previously could. (#1223)
 - Opening a channel now accounts for the funding transaction's fee when checking the anchor
   reserve, and fails with `NodeError::InsufficientFunds` if the amount exceeds what funding the
   channel with all of our on-chain funds would add at our fee estimate. Previously, a high fee

@@ -156,13 +156,10 @@ pub(crate) fn is_valid_splice_fee_rate(fee_rate: FeeRate) -> bool {
 	fee_rate.to_sat_per_kwu() >= FEERATE_FLOOR_SATS_PER_KW as u64 && fee_rate <= MAX_SPLICE_FEE_RATE
 }
 
-/// Returns the fee, in sats, that a splice-out paying to `output` at `fee_rate_per_kw` takes from
-/// our channel balance.
-///
-/// As the initiator, we pay for the transaction's common fields, the input spending the current
-/// funding output and the new funding output, along with our own output. This mirrors how LDK
-/// estimates the fee of our contribution when we call `ChannelManager::splice_channel`.
-pub(crate) fn splice_out_fee_sats(output: &TxOut, fee_rate_per_kw: u32) -> u64 {
+/// The weight of a splice transaction we pay for as its initiator, besides our own inputs and
+/// outputs: its common fields, the input spending the current funding output and the new funding
+/// output.
+const SPLICE_INITIATOR_WEIGHT: u64 = {
 	// Version, locktime, input count and output count, plus the segwit marker and flag.
 	const COMMON_FIELDS_WEIGHT: u64 = (4 + 4 + 1 + 1) * WITNESS_SCALE_FACTOR as u64 + 2;
 	// Outpoint, sequence and an empty script_sig, plus the 2-of-2 multisig witness. LDK takes 1 WU
@@ -172,12 +169,61 @@ pub(crate) fn splice_out_fee_sats(output: &TxOut, fee_rate_per_kw: u32) -> u64 {
 	// Value, script length and a P2WSH script.
 	const FUNDING_OUTPUT_WEIGHT: u64 = (8 + 1 + 34) * WITNESS_SCALE_FACTOR as u64;
 
-	let weight = COMMON_FIELDS_WEIGHT
-		+ FUNDING_INPUT_WEIGHT
-		+ FUNDING_OUTPUT_WEIGHT
-		+ output.weight().to_wu();
-	// Rounded up, as LDK does.
+	COMMON_FIELDS_WEIGHT + FUNDING_INPUT_WEIGHT + FUNDING_OUTPUT_WEIGHT
+};
+
+/// Returns the fee for `weight` at `fee_rate_per_kw`, rounded up, as LDK does.
+fn fee_for_weight(fee_rate_per_kw: u32, weight: u64) -> u64 {
 	(u64::from(fee_rate_per_kw) * weight).div_ceil(1000)
+}
+
+/// Returns the fee, in sats, that a splice-out paying to `output` at `fee_rate_per_kw` takes from
+/// our channel balance.
+///
+/// As the initiator, we pay for the transaction's common fields, the input spending the current
+/// funding output and the new funding output, along with our own output. This mirrors how LDK
+/// estimates the fee of our contribution when we call `ChannelManager::splice_channel`.
+pub(crate) fn splice_out_fee_sats(output: &TxOut, fee_rate_per_kw: u32) -> u64 {
+	fee_for_weight(fee_rate_per_kw, SPLICE_INITIATOR_WEIGHT + output.weight().to_wu())
+}
+
+/// Returns the amount, in sats, that a splice-in of `splice_amount_sats` at `fee_rate_per_kw`
+/// takes from our on-chain wallet: our `input_count` P2WPKH inputs, worth `inputs_sats` in total,
+/// less the change they return to us.
+///
+/// This mirrors how LDK computes our change when we call `ChannelManager::splice_channel`. As the
+/// initiator, we pay for the transaction's common fields, the input spending the current funding
+/// output and the new funding output, along with our inputs. If less than the dust limit is left
+/// beyond the amount and that fee, all of it goes to fees. Otherwise, the change output pays for
+/// itself, and is dropped too if no more than the dust limit is left after that.
+pub(crate) fn splice_in_wallet_spend_sats(
+	inputs_sats: u64, input_count: usize, splice_amount_sats: u64, fee_rate_per_kw: u32,
+) -> u64 {
+	// The dust limit LDK applies to our outputs in the splice transaction.
+	const HOLDER_DUST_LIMIT_SATS: u64 = 354;
+	// Outpoint, sequence and an empty script_sig, plus a witness of the item count, a signature and
+	// a public key, each with its length. LDK takes 1 WU off, as for the funding input.
+	const P2WPKH_INPUT_WEIGHT: u64 =
+		(32 + 4 + 4 + 1) * WITNESS_SCALE_FACTOR as u64 + (1 + 1 + 72 + 1 + 33) - 1;
+	// Value, script length and a P2WPKH script.
+	const P2WPKH_OUTPUT_WEIGHT: u64 = (8 + 1 + 22) * WITNESS_SCALE_FACTOR as u64;
+
+	let weight = SPLICE_INITIATOR_WEIGHT + input_count as u64 * P2WPKH_INPUT_WEIGHT;
+	let remaining_sats = inputs_sats
+		.saturating_sub(splice_amount_sats)
+		.saturating_sub(fee_for_weight(fee_rate_per_kw, weight));
+	let change_sats = if remaining_sats < HOLDER_DUST_LIMIT_SATS {
+		0
+	} else {
+		let change_sats =
+			remaining_sats.saturating_sub(fee_for_weight(fee_rate_per_kw, P2WPKH_OUTPUT_WEIGHT));
+		if change_sats > HOLDER_DUST_LIMIT_SATS {
+			change_sats
+		} else {
+			0
+		}
+	};
+	inputs_sats - change_sats
 }
 
 pub(crate) fn get_all_conf_targets() -> [ConfirmationTarget; 10] {
@@ -239,7 +285,10 @@ mod tests {
 	use bitcoin::{Amount, FeeRate, ScriptBuf, TxOut, WPubkeyHash, WScriptHash};
 	use lightning::chain::chaininterface::FEERATE_FLOOR_SATS_PER_KW;
 
-	use super::{is_valid_splice_fee_rate, splice_out_fee_sats, MAX_SPLICE_FEE_RATE};
+	use super::{
+		is_valid_splice_fee_rate, splice_in_wallet_spend_sats, splice_out_fee_sats,
+		MAX_SPLICE_FEE_RATE,
+	};
 
 	#[test]
 	fn splice_fee_rate_must_be_within_floor_and_max() {
@@ -277,5 +326,39 @@ mod tests {
 		};
 		assert_eq!(p2wsh_output.weight().to_wu(), 172);
 		assert_eq!(splice_out_fee_sats(&p2wsh_output, 2_500), 1_923);
+	}
+
+	#[test]
+	fn splice_in_wallet_spend_keeps_change() {
+		// We pay for 597 WU of the splice transaction, plus 271 WU per input: 868 WU, or 868 sats
+		// at 1,000 sat/kW. The change pays another 124 WU for its own output.
+		assert_eq!(splice_in_wallet_spend_sats(100_000, 1, 50_000, 1_000), 50_000 + 868 + 124);
+		// A second input adds its own 271 WU.
+		assert_eq!(splice_in_wallet_spend_sats(100_000, 2, 50_000, 1_000), 50_000 + 1_139 + 124);
+		// 868 WU at 253 sat/kW is 219.604 sats, and 124 WU 31.372 sats, both rounded up.
+		assert_eq!(splice_in_wallet_spend_sats(100_000, 1, 50_000, 253), 50_000 + 220 + 32);
+	}
+
+	#[test]
+	fn splice_in_wallet_spend_drops_change_below_dust() {
+		// With 353 sats left beyond the amount and the fee, there's no change.
+		assert_eq!(splice_in_wallet_spend_sats(100_000, 1, 100_000 - 868 - 353, 1_000), 100_000);
+		// With nothing left, the inputs are spent in full too.
+		assert_eq!(splice_in_wallet_spend_sats(100_000, 1, 100_000 - 868, 1_000), 100_000);
+	}
+
+	#[test]
+	fn splice_in_wallet_spend_drops_change_left_at_dust_after_its_own_fee() {
+		// 478 sats left pays 124 sats for the change output, which leaves the dust limit of 354
+		// sats, so the change is dropped.
+		assert_eq!(
+			splice_in_wallet_spend_sats(100_000, 1, 100_000 - 868 - 478, 1_000),
+			100_000
+		);
+		// One more sat and the change is kept.
+		assert_eq!(
+			splice_in_wallet_spend_sats(100_000, 1, 100_000 - 868 - 479, 1_000),
+			100_000 - 355
+		);
 	}
 }
